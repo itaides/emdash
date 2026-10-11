@@ -23,7 +23,6 @@
  * own `astro/client` ambient surface anyway, so the runtime dynamic
  * import resolves there at typecheck time without our help.
  */
-
 import type { ContentSeo } from "./database/repositories/types.js";
 import { getFallbackChain, getI18nConfig, isI18nEnabled } from "./i18n/config.js";
 import {
@@ -44,6 +43,8 @@ import {
 	invalidateSchemaObjectCache,
 } from "./object-cache/index.js";
 import { primeSeoPanel } from "./page/seo-panel.js";
+import type { ResolvedReferencePage } from "./references/resolve.js";
+import { loadedStagedReferences } from "./references/staged.js";
 import type { ReferenceQuery, ReferenceSelection } from "./references/types.js";
 import { requestCached } from "./request-cache.js";
 import { getRequestContext } from "./request-context.js";
@@ -166,7 +167,8 @@ export type { ReferenceQuery, ReferenceSelection };
  * here. Use the {@link CollectionFilter} union for any value that may be
  * either.
  */
-export interface CollectionFilterBase {
+export interface CollectionFilterBase<S = ReferenceSelection> {
+	references?: S;
 	status?: "draft" | "published" | "archived";
 	limit?: number;
 	/**
@@ -205,7 +207,7 @@ export interface CollectionFilterBase {
 }
 
 /** Keyset-paginated query filter. Cannot also carry an `offset`. */
-export interface CursorCollectionFilter extends CollectionFilterBase {
+export interface CursorCollectionFilter<S = ReferenceSelection> extends CollectionFilterBase<S> {
 	/**
 	 * Opaque cursor for keyset pagination.
 	 * Pass the `nextCursor` value from a previous result to fetch the next page.
@@ -223,7 +225,7 @@ export interface CursorCollectionFilter extends CollectionFilterBase {
 }
 
 /** Offset-paginated query filter. Cannot also carry a `cursor`. */
-export interface OffsetCollectionFilter extends CollectionFilterBase {
+export interface OffsetCollectionFilter<S = ReferenceSelection> extends CollectionFilterBase<S> {
 	/**
 	 * Skip this many entries before returning results (offset pagination).
 	 *
@@ -252,7 +254,9 @@ export interface OffsetCollectionFilter extends CollectionFilterBase {
  * `cursor` and `offset` is a compile-time error, since they are mutually
  * exclusive ways to express "the next page" (cursor wins at runtime).
  */
-export type CollectionFilter = CursorCollectionFilter | OffsetCollectionFilter;
+export type CollectionFilter<S = ReferenceSelection> =
+	| CursorCollectionFilter<S>
+	| OffsetCollectionFilter<S>;
 
 export interface ContentEntry<T = Record<string, unknown>, R = ReferencePages> {
 	id: string;
@@ -352,9 +356,9 @@ export async function getPublishedDates(
 /**
  * Result from getEmDashCollection
  */
-export interface CollectionResult<T> {
+export interface CollectionResult<T, R = ReferencePages> {
 	/** The entries (empty array if error or none found) */
-	entries: ContentEntry<T>[];
+	entries: ContentEntry<T, R>[];
 	/** Error if the query failed */
 	error?: Error;
 	/** Cache hint for route caching (pass to Astro.cache.set()) */
@@ -558,6 +562,22 @@ function canExposeRevisionMetadata(
  * const { entries: drafts } = await getEmDashCollection("posts", { status: "draft" });
  * ```
  */
+export function getEmDashCollection<
+	T extends string,
+	D = InferCollectionData<T>,
+	S extends SelectableReferences<T> = SelectableReferences<T>,
+>(
+	type: T,
+	filter: CollectionFilter<S> & { references: S },
+): Promise<CollectionResult<D, SelectedReferences<T, S>>>;
+export function getEmDashCollection<T extends string, D = InferCollectionData<T>>(
+	type: T,
+	filter?: CollectionFilter<undefined>,
+): Promise<CollectionResult<D>>;
+export function getEmDashCollection<T extends string, D = InferCollectionData<T>>(
+	type: T,
+	filter?: CollectionFilter<SelectableReferences<T>>,
+): Promise<CollectionResult<D>>;
 export async function getEmDashCollection<T extends string, D = InferCollectionData<T>>(
 	type: T,
 	filter?: CollectionFilter,
@@ -618,7 +638,9 @@ async function loadCollectionCached<T extends string, D = InferCollectionData<T>
 	filter?: CollectionFilter,
 ): Promise<CollectionResult<D>> {
 	const snapshot = await cachedQuery<ContentSnapshot<CachedCollectionValue>>({
-		namespace: contentNamespaces(type),
+		namespace: filter?.references
+			? [...contentNamespaces(type), ...(await referenceTargetNamespaces(type, filter.references))]
+			: contentNamespaces(type),
 		key: `collection:${collectionCacheKey(type, filter)}|loc=${effectiveLocaleKey(filter)}`,
 		load: async () => {
 			const result = await getEmDashCollectionUncached<T, D>(type, filter);
@@ -783,7 +805,7 @@ function collectionCacheKey(type: string, filter?: CollectionFilter): string {
 		filter.orderBy ? JSON.stringify(filter.orderBy) : "",
 		filter.locale ?? "",
 	];
-	return `collection:${type}:${parts.join("|")}`;
+	return `collection:${type}:${parts.join("|")}${filter.references ? `|refs=${stableStringify(filter.references)}` : ""}`;
 }
 
 function stableStringify(value: Record<string, unknown>): string {
@@ -979,7 +1001,7 @@ async function getEmDashCollectionUncached<T extends string, D = InferCollection
 	const isEditMode = ctx?.editMode ?? false;
 	const portableTextFields =
 		isEditMode && pageEntries.length > 0 ? await getPortableTextFieldSlugs(type) : undefined;
-	const entriesWithEdit = pageEntries.map((entry: ContentEntry<D>) => {
+	const entriesWithEdit: ContentEntry<D>[] = pageEntries.map((entry: ContentEntry<D>) => {
 		const dbId = entryDatabaseId(entry);
 		if (isEditMode) {
 			tagEditableFields(entryData(entry), type, dbId, portableTextFields);
@@ -1003,11 +1025,44 @@ async function getEmDashCollectionUncached<T extends string, D = InferCollection
 		hydrateEntryTerms(type, entriesWithEdit, resolvedLocale),
 	]);
 
+	let resolvedCacheHint = cacheHint ?? {};
+	if (filter?.references) {
+		try {
+			const { resolveReferencePagesBatch } = await import("./references/resolve.js");
+			const parents = entriesWithEdit.filter((entry) =>
+				dataStr(entryData(entry), "translationGroup"),
+			);
+			const pages = await resolveReferencePagesBatch(
+				type,
+				filter.references,
+				parents.map((entry) => ({
+					entryGroup: dataStr(entryData(entry), "translationGroup"),
+					locale: dataStr(entryData(entry), "locale") || null,
+					serveDrafts:
+						isEditMode || (ctx?.preview !== undefined && canExposeRevisionMetadata(entry, type)),
+					staged: loadedStagedReferences(entryData(entry)),
+				})),
+			);
+			for (const [index, entry] of parents.entries()) {
+				resolvedCacheHint = mergeCacheHints(
+					resolvedCacheHint,
+					attachResolvedReferences(entry, pages[index]),
+				);
+			}
+		} catch (referenceError) {
+			return {
+				entries: [],
+				error: referenceError instanceof Error ? referenceError : new Error(String(referenceError)),
+				cacheHint: {},
+			};
+		}
+	}
+
 	return {
 		entries: entriesWithEdit,
 		nextCursor,
 		hasMore: hasMoreResult,
-		cacheHint: cacheHint ?? {},
+		cacheHint: resolvedCacheHint,
 	};
 }
 
@@ -1093,6 +1148,13 @@ async function attachReferences<D>(
 		selection: options.selection,
 	});
 
+	return attachResolvedReferences(entry, pages);
+}
+
+function attachResolvedReferences<D>(
+	entry: ContentEntry<D>,
+	pages: Record<string, ResolvedReferencePage>,
+): CacheHint {
 	const references: ReferencePages = {};
 	const tags: string[] = [];
 	let lastModified: Date | undefined;

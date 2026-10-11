@@ -10,7 +10,6 @@
  * - Each content type maps to its own database table: ec_posts, ec_products, etc.
  * - `getEmDashCollection()` / `getEmDashEntry()` wrap Astro's live collection API
  */
-
 import type { LiveLoader } from "astro/loaders";
 import { Kysely, type RawBuilder, sql, type Dialect } from "kysely";
 
@@ -23,6 +22,7 @@ import { validateIdentifier } from "./database/validate.js";
 import { getI18nConfig } from "./i18n/config.js";
 import type { Database } from "./index.js";
 import { primeSeoPanel } from "./page/seo-panel.js";
+import { stashStagedReferences } from "./references/staged.js";
 import { getRequestContext } from "./request-context.js";
 import { chunks, SQL_BATCH_SIZE } from "./utils/chunks.js";
 import { isMissingColumnError, isMissingTableError } from "./utils/db-errors.js";
@@ -1946,6 +1946,7 @@ export function emdashLoader(): LiveLoader<EntryData, EntryFilter, LoaderCollect
 					if (draft) {
 						const revEntry = revisionEntry(row, draft, booleanFields, sortColumn);
 						stashFolded(revEntry.data, row);
+						stashStagedReferences(revEntry.data, draft);
 						return revEntry;
 					}
 					const id = entryIdForRow(row);

@@ -155,3 +155,19 @@ export function mergeStagedReferenceBaselines(
 	const existing = readStagedReferenceBaselines(base) ?? {};
 	return { ...incoming, ...existing };
 }
+
+const LOADED_STAGED_REFERENCES = Symbol.for("emdash.loadedStagedReferences");
+
+export function stashStagedReferences(
+	data: Record<string, unknown>,
+	snapshot: Record<string, unknown>,
+): void {
+	Object.defineProperty(data, LOADED_STAGED_REFERENCES, { value: readStagedReferences(snapshot) });
+}
+
+export function loadedStagedReferences(
+	data: Record<string, unknown>,
+): StagedReferences | undefined {
+	const staged: unknown = Reflect.get(data, LOADED_STAGED_REFERENCES);
+	return readStagedReferences({ _references: staged });
+}
